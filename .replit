@@ -1,0 +1,34 @@
+modules = ["python-3.11"]
+[agent]
+expertMode = true
+
+[deployment]
+run = ["sh", "-c", "python3 main.py"]
+deploymentTarget = "gce"
+ignorePorts = true
+
+[nix]
+packages = ["glibcLocales"]
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Trading Agent"
+
+[[workflows.workflow]]
+name = "Trading Agent"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python3 main.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
