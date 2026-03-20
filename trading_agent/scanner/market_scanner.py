@@ -54,12 +54,22 @@ class _CTFormatter(logging.Formatter):
         )
         return ct.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
 
-_handler = logging.StreamHandler()
-_handler.setFormatter(_CTFormatter(
+from logging.handlers import RotatingFileHandler as _RotatingFileHandler
+
+_fmt = _CTFormatter(
     fmt="%(asctime)s CT [%(levelname)s] %(name)s — %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-))
-logging.basicConfig(level=logging.INFO, handlers=[_handler])
+)
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_fmt)
+
+_file_handler = _RotatingFileHandler(
+    "trading.log", maxBytes=5 * 1024 * 1024, backupCount=3
+)
+_file_handler.setFormatter(_fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[_handler, _file_handler])
 logger = logging.getLogger("MarketScanner")
 
 CENTRAL = ZoneInfo("America/Chicago")
