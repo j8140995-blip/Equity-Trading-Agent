@@ -54,22 +54,12 @@ class _CTFormatter(logging.Formatter):
         )
         return ct.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
 
-from logging.handlers import RotatingFileHandler as _RotatingFileHandler
-
-_fmt = _CTFormatter(
+_handler = logging.StreamHandler()
+_handler.setFormatter(_CTFormatter(
     fmt="%(asctime)s CT [%(levelname)s] %(name)s — %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-)
-
-_handler = logging.StreamHandler()
-_handler.setFormatter(_fmt)
-
-_file_handler = _RotatingFileHandler(
-    "trading.log", maxBytes=5 * 1024 * 1024, backupCount=3
-)
-_file_handler.setFormatter(_fmt)
-
-logging.basicConfig(level=logging.INFO, handlers=[_handler, _file_handler])
+))
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logger = logging.getLogger("MarketScanner")
 
 CENTRAL = ZoneInfo("America/Chicago")
@@ -128,7 +118,7 @@ class Config:
     MAX_POSITION_PCT: float       = 5.0
     RISK_REWARD_MIN: float        = 5.0
     MAX_DAILY_LOSS_PCT: float     = 3.0
-    MAX_OPEN_POSITIONS: int       = 8
+    MAX_OPEN_POSITIONS: int       = 10
     MAX_SECTOR_POSITIONS: int     = 3    # max concurrent positions in same sector
 
     # Cadence
@@ -573,14 +563,31 @@ class RiskManager:
             return None
 
         try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
             account         = self.alpaca.get_account()
             portfolio_value = float(account.portfolio_value)
             open_positions  = len(self.alpaca.get_all_positions())
+            # Count pending orders too — critical for after-hours batching
+            pending_orders  = self.alpaca.get_orders(
+                GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            )
+            # Count unique symbols with open buy orders not already in positions
+            position_symbols = {p.symbol for p in self.alpaca.get_all_positions()}
+            pending_symbols  = {
+                o.symbol for o in pending_orders
+                if o.side.value == "buy" and o.symbol not in position_symbols
+            }
+            total_exposure = open_positions + len(pending_symbols)
         except Exception as exc:
             logger.error("Alpaca account query failed: %s", exc)
             return None
 
-        if open_positions >= Config.MAX_OPEN_POSITIONS:
+        if total_exposure >= Config.MAX_OPEN_POSITIONS:
+            logger.debug(
+                "Position limit reached: %d positions + %d pending = %d / %d",
+                open_positions, len(pending_symbols), total_exposure, Config.MAX_OPEN_POSITIONS,
+            )
             return None
 
         stop_distance = candidate.entry - candidate.stop_loss
@@ -737,7 +744,8 @@ class ExecutionEngine:
                 take_profit=TakeProfitRequest(limit_price=target_price),
                 stop_loss=StopLossRequest(
                     stop_price=stop_price,
-                    limit_price=round(stop_price * 0.995, 2),
+                    # No limit_price = stop-market order.
+                    # Guarantees execution on gap-downs unlike stop-limit.
                 ),
             )
             submitted = self.alpaca.submit_order(order)
