@@ -3,8 +3,8 @@ modules = ["python-3.11"]
 expertMode = true
 
 [deployment]
-run = ["sh", "-c", "python3 main.py"]
-deploymentTarget = "gce"
+run = ["python3", "-u", "main.py"]
+deploymentTarget = "vm"
 ignorePorts = true
 
 [nix]
