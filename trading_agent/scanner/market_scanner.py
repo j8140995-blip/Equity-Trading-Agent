@@ -410,6 +410,15 @@ class TechnicalAnalyzer:
             df["high"], df["low"], df["close"], window=14
         )
 
+        # VWAP: rolling 20-day volume-weighted average price
+        # Price above VWAP = bullish (buyers in control)
+        # Price below VWAP = bearish (sellers in control)
+        vwap_window = 20
+        df["vwap"] = (
+            (df["close"] * df["volume"]).rolling(vwap_window).sum()
+            / df["volume"].rolling(vwap_window).sum()
+        )
+
         row  = df.iloc[-1]
         prev = df.iloc[-2]
         total = 0.0
@@ -435,17 +444,28 @@ class TechnicalAnalyzer:
         elif row["macd"] > row["signal"]:
             total += 10
 
-        # Volume confirmation (20 pts)
+        # VWAP position (15 pts)
+        # Price vs VWAP tells us who controls momentum
+        vwap = row["vwap"]
+        close = row["close"]
+        if vwap > 0:
+            vwap_deviation = (close - vwap) / vwap
+            if vwap_deviation >= 0.02:    total += 15   # strongly above VWAP
+            elif vwap_deviation >= 0.00:  total += 10   # above VWAP
+            elif vwap_deviation >= -0.02: total += 5    # just below VWAP
+            # below -2% gets 0 — bearish price action
+
+        # Volume confirmation (12 pts)
         avg_vol = df["volume"].iloc[-21:-1].mean()
         if avg_vol > 0 and row["volume"] >= 1.5 * avg_vol:
-            total += 20
+            total += 12
         elif avg_vol > 0 and row["volume"] >= 1.0 * avg_vol:
-            total += 10
+            total += 6
 
-        # ATR setup quality (15 pts)
+        # ATR setup quality (8 pts)
         atr_pct = (row["atr"] / row["close"]) * 100 if row["close"] > 0 else 0
-        if 2.5 <= atr_pct <= 8.0:   total += 15
-        elif 2.0 <= atr_pct < 2.5:  total += 8
+        if 2.5 <= atr_pct <= 8.0:   total += 8
+        elif 2.0 <= atr_pct < 2.5:  total += 4
 
         return min(total, 100.0)
 
