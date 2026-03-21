@@ -758,7 +758,7 @@ class ExecutionEngine:
                 symbol=ticker.symbol,
                 qty=signal.position_size,
                 side=side,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=TimeInForce.GTC,   # GTC so stop/target persist across sessions
                 limit_price=limit_price,
                 order_class=OrderClass.BRACKET,
                 take_profit=TakeProfitRequest(limit_price=target_price),
