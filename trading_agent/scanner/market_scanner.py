@@ -1072,10 +1072,21 @@ class TradingAgent:
         pending_symbols = self._get_pending_order_symbols()
         excluded        = open_symbols | pending_symbols
 
-        # Build sector counts from existing positions
+        # Capacity = how many new positions we can open right now
+        total_exposure = len(open_symbols) + len(pending_symbols)
+        capacity       = Config.MAX_OPEN_POSITIONS - total_exposure
+
+        if capacity <= 0:
+            logger.info(
+                "Position limit reached (%d / %d) — no new orders this cycle.",
+                total_exposure, Config.MAX_OPEN_POSITIONS,
+            )
+            return
+
+        # Build sector counts from existing positions + pending
         from trading_agent.modules.sector_map import get_sector
         sector_counts: dict[str, int] = {}
-        for sym in open_symbols:
+        for sym in open_symbols | pending_symbols:
             sector = get_sector(sym)
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
@@ -1087,8 +1098,10 @@ class TradingAgent:
 
         submitted = 0
         for sig in signals:
-            if submitted >= 3:
+            # Hard cap: never exceed available capacity this cycle
+            if submitted >= capacity:
                 break
+
             sym    = sig.ticker.symbol
             sector = get_sector(sym)
 
@@ -1109,6 +1122,7 @@ class TradingAgent:
             excluded.add(sym)
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
             submitted += 1
+            logger.info("Slot used: %d / %d capacity this cycle.", submitted, capacity)
             await asyncio.sleep(0.5)
 
     async def run(self) -> None:
