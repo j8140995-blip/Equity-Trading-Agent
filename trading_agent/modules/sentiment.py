@@ -4,28 +4,28 @@ sentiment.py
 Phase 2 Module — Sentiment & News Analysis
 AI Trading Agent | Paper Trading Only
 
-Data sources:
-  1. Benzinga via Alpaca News API  — full article content, per-ticker
-  2. Google News RSS               — headline coverage, per-ticker
-  3. SEC EDGAR 8-K feed            — material event detection, per-ticker
+Scoring engine: VADER + Financial Lexicon Hybrid
+  - VADER (Valence Aware Dictionary and sEntiment Reasoner) is purpose-built
+    for short news/social text and handles negation, intensifiers, punctuation
+  - Custom financial term boosts tune VADER specifically for market language
+  - Applied to full article content from Benzinga + Google News + SEC 8-K
 
-Scoring engine: Claude API (claude-haiku-4-5-20251001)
-  Replaces lexicon-based NLP. Claude reads actual article content and
-  returns a calibrated 0-100 sentiment score with reasoning.
-  Only called when articles exist — tickers with no news return 50.0.
-  Cached 2 hours to minimize API usage.
+Why VADER over raw lexicon:
+  - Handles negation: "not a good quarter" scores negative (lexicon misses this)
+  - Intensifiers: "CRUSHED earnings" scores higher than "beat earnings"
+  - Punctuation: "Earnings BEAT!!!" scores higher than "earnings beat"
+  - Produces compound score in [-1, +1], maps cleanly to 0-100
 
-Scoring rubric (0–100):
-  0-20  : Strongly bearish (fraud, bankruptcy, severe miss)
-  21-40 : Bearish (guidance cut, downgrade, negative catalyst)
-  41-59 : Neutral (no meaningful signal)
-  60-75 : Bullish (beat, upgrade, positive catalyst)
-  76-100: Strongly bullish (blowout, major deal, FDA approval)
+Scoring rubric (0-100):
+  Benzinga articles   : 50% weight (full content, per-ticker)
+  Google News         : 30% weight (headlines, breadth)
+  SEC 8-K             : 20% weight (material events)
+
+Cache TTL: 2 hours
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
@@ -34,103 +34,113 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 logger = logging.getLogger("SentimentAnalyzer")
 
 HEADERS_SEC  = {"User-Agent": "ai-trading-agent contact@trading-agent.local"}
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-CLAUDE_URL   = "https://api.anthropic.com/v1/messages"
+
+# ---------------------------------------------------------------------------
+# Financial lexicon boosts for VADER
+# These are added to VADER's internal dictionary to tune it for finance.
+# Positive = bullish signal strength, Negative = bearish signal strength
+# VADER uses [-4, +4] scale internally
+# ---------------------------------------------------------------------------
+FINANCIAL_LEXICON = {
+    # Strong bullish
+    "beat":          2.5,
+    "beats":         2.5,
+    "blowout":       3.5,
+    "crush":         3.0,
+    "crushed":       3.0,
+    "smashed":       2.5,
+    "raised guidance": 3.0,
+    "raised outlook":  3.0,
+    "upgrade":       2.5,
+    "upgraded":      2.5,
+    "strong buy":    3.0,
+    "outperform":    2.5,
+    "fda approval":  3.5,
+    "buyback":       2.0,
+    "dividend increase": 2.0,
+    "contract win":  2.5,
+    "record revenue": 3.0,
+    "record earnings": 3.0,
+    "accelerating":  1.5,
+    "momentum":      1.0,
+    "breakout":      2.0,
+    "bullish":       2.0,
+
+    # Strong bearish
+    "miss":         -2.5,
+    "missed":       -2.5,
+    "lowered guidance": -3.0,
+    "cut guidance": -3.0,
+    "downgrade":    -2.5,
+    "downgraded":   -2.5,
+    "underperform": -2.5,
+    "sell rating":  -2.0,
+    "profit warning": -3.5,
+    "bankruptcy":   -4.0,
+    "fraud":        -4.0,
+    "sec probe":    -3.5,
+    "investigation": -2.5,
+    "recall":       -2.5,
+    "layoffs":      -2.0,
+    "job cuts":     -2.5,
+    "debt crisis":  -3.0,
+    "default":      -3.5,
+    "impairment":   -2.5,
+    "shortfall":    -2.5,
+    "disappointing": -2.0,
+    "headwinds":    -1.5,
+    "bearish":      -2.0,
+    "tariff":       -1.5,
+    "sanction":     -2.0,
+}
 
 
-def _call_claude(prompt: str) -> Optional[str]:
-    """Calls Claude API and returns the text response."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        logger.warning("ANTHROPIC_API_KEY not set — falling back to neutral sentiment.")
-        return None
-    try:
-        resp = requests.post(
-            CLAUDE_URL,
-            headers={
-                "Content-Type":      "application/json",
-                "x-api-key":         api_key,
-                "anthropic-version": "2023-06-01",
-            },
-            json={
-                "model":      CLAUDE_MODEL,
-                "max_tokens": 150,
-                "messages":   [{"role": "user", "content": prompt}],
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["content"][0]["text"].strip()
-    except Exception as exc:
-        logger.debug("Claude API call failed: %s", exc)
-        return None
+def _build_analyzer() -> SentimentIntensityAnalyzer:
+    """Build VADER analyzer with financial lexicon injected."""
+    vader = SentimentIntensityAnalyzer()
+    vader.lexicon.update(FINANCIAL_LEXICON)
+    return vader
 
 
-def _score_with_claude(symbol: str, articles: list[dict]) -> float:
+# Module-level singleton — one analyzer for the whole process
+_VADER = _build_analyzer()
+
+
+def _vader_score(text: str) -> float:
     """
-    Sends article headlines + summaries to Claude and gets a 0-100 score.
-    Falls back to 50.0 on any failure.
+    Score text with VADER. Returns compound score in [-1, +1].
+    Compound is VADER's normalized aggregate — best single metric.
     """
-    if not articles:
-        return 50.0
+    if not text or not text.strip():
+        return 0.0
+    scores = _VADER.polarity_scores(text)
+    return scores["compound"]
 
-    # Build article summary (keep it compact to save tokens)
-    article_text = ""
-    for i, a in enumerate(articles[:5], 1):
-        headline = a.get("headline", "")
-        summary  = a.get("summary", "") or a.get("content", "")[:300]
-        date     = a.get("created_at", "")[:10]
-        article_text += f"{i}. [{date}] {headline}\n{summary}\n\n"
 
-    prompt = f"""You are a financial sentiment analyst. Score the news sentiment for stock ticker {symbol} based on these recent articles.
-
-ARTICLES:
-{article_text.strip()}
-
-Return ONLY a JSON object with this exact format:
-{{"score": <integer 0-100>, "reason": "<10 words max>"}}
-
-Scoring guide:
-- 0-20: Severely bearish (fraud, bankruptcy, massive miss)
-- 21-40: Bearish (guidance cut, downgrade, bad earnings)
-- 41-59: Neutral (mixed news or no clear signal)
-- 60-75: Bullish (earnings beat, upgrade, positive catalyst)
-- 76-100: Strongly bullish (blowout quarter, major deal, FDA approval)
-
-JSON only, no other text:"""
-
-    response = _call_claude(prompt)
-    if not response:
-        return 50.0
-
-    try:
-        # Strip any markdown fences if present
-        clean = response.strip().strip("```json").strip("```").strip()
-        data  = json.loads(clean)
-        score = float(data.get("score", 50))
-        score = max(0.0, min(100.0, score))
-        reason = data.get("reason", "")
-        logger.debug("%s sentiment: %.0f — %s", symbol, score, reason)
-        return score
-    except Exception as exc:
-        logger.debug("Claude response parse failed for %s: %s — raw: %s", symbol, exc, response[:100])
-        return 50.0
+def _compound_to_100(compound: float, scale: float = 0.35) -> float:
+    """
+    Map VADER compound to [0, 100] with 50 as neutral.
+    Real financial news rarely exceeds ±0.35 when averaged across articles,
+    so we scale to that realistic range rather than the full [-1, +1].
+    This gives full spread: compound=-0.35 → ~0, compound=+0.35 → ~100.
+    """
+    return round(max(0.0, min(100.0, 50.0 + (compound / scale) * 50.0)), 2)
 
 
 class SentimentAnalyzer:
     """
-    Multi-source sentiment scorer using Claude API for scoring.
-    Data: Benzinga (primary), Google News (headlines), SEC 8-K (events).
+    Multi-source sentiment scorer using VADER + financial lexicon.
+    Sources: Benzinga (50%), Google News (30%), SEC 8-K (20%).
     Cache TTL: 2 hours.
     """
 
     CACHE_TTL     = 7_200   # 2 hours
-    NEWS_LOOKBACK = 3       # days of news
+    NEWS_LOOKBACK = 3       # days of news to consider
 
     def __init__(self, alpaca_api_key: str, alpaca_secret_key: str):
         self.alpaca_key    = alpaca_api_key
@@ -151,12 +161,11 @@ class SentimentAnalyzer:
         self._cache[symbol] = (time.time(), score)
 
     # ------------------------------------------------------------------
-    # Source 1: Benzinga via Alpaca News API
+    # Source 1: Benzinga via Alpaca (50%)
     # ------------------------------------------------------------------
-    def _fetch_benzinga_articles(self, symbol: str) -> list[dict]:
-        """Fetches last 3 days of Benzinga articles. Returns raw article dicts."""
+    def _score_benzinga(self, symbol: str) -> float:
         try:
-            start = (datetime.now(timezone.utc) - timedelta(days=self.NEWS_LOOKBACK))
+            start = datetime.now(timezone.utc) - timedelta(days=self.NEWS_LOOKBACK)
             resp = requests.get(
                 "https://data.alpaca.markets/v1beta1/news",
                 headers={
@@ -165,49 +174,78 @@ class SentimentAnalyzer:
                 },
                 params={
                     "symbols":         symbol,
-                    "limit":           5,
+                    "limit":           10,
                     "include_content": "true",
                     "start":           start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 },
                 timeout=6,
             )
             resp.raise_for_status()
-            return resp.json().get("news", [])
+            articles = resp.json().get("news", [])
+            if not articles:
+                return 50.0
+
+            now = datetime.now(timezone.utc)
+            weighted_scores = []
+            for article in articles:
+                headline = article.get("headline", "")
+                content  = article.get("content", "")[:800]   # cap content length
+                text     = f"{headline}. {content}"
+
+                # Recency weighting — today = 1.0, 3 days ago = 0.3
+                try:
+                    pub = datetime.fromisoformat(
+                        article.get("created_at", "").replace("Z", "+00:00")
+                    )
+                    age_hours  = max(0, (now - pub).total_seconds() / 3600)
+                    recency_wt = max(0.3, 1.0 - age_hours / (self.NEWS_LOOKBACK * 24))
+                except Exception:
+                    recency_wt = 0.5
+
+                compound = _vader_score(text)
+                weighted_scores.append(compound * recency_wt)
+
+            avg = sum(weighted_scores) / len(weighted_scores)
+            return _compound_to_100(avg)
+
         except Exception as exc:
             logger.debug("Benzinga fetch failed for %s: %s", symbol, exc)
-            return []
+            return 50.0
 
     # ------------------------------------------------------------------
-    # Source 2: Google News RSS headlines
+    # Source 2: Google News RSS (30%)
     # ------------------------------------------------------------------
-    def _fetch_google_headlines(self, symbol: str) -> list[dict]:
-        """Fetches Google News RSS headlines as article dicts."""
+    def _score_google_news(self, symbol: str) -> float:
         try:
             resp = requests.get(
                 "https://news.google.com/rss/search",
-                params={"q": f"{symbol} stock", "hl": "en-US", "gl": "US", "ceid": "US:en"},
+                params={"q": f"{symbol} stock", "hl": "en-US",
+                        "gl": "US", "ceid": "US:en"},
                 timeout=6,
             )
             resp.raise_for_status()
-            root    = ET.fromstring(resp.text)
-            items   = root.findall(".//item")[:5]
-            articles = []
+            root  = ET.fromstring(resp.text)
+            items = root.findall(".//item")[:15]
+            if not items:
+                return 50.0
+
+            scores = []
             for item in items:
-                articles.append({
-                    "headline": item.findtext("title") or "",
-                    "summary":  item.findtext("description") or "",
-                    "created_at": item.findtext("pubDate") or "",
-                })
-            return articles
+                title = item.findtext("title") or ""
+                desc  = item.findtext("description") or ""
+                scores.append(_vader_score(f"{title}. {desc}"))
+
+            avg = sum(scores) / len(scores)
+            return _compound_to_100(avg)
+
         except Exception as exc:
-            logger.debug("Google News fetch failed for %s: %s", symbol, exc)
-            return []
+            logger.debug("Google News failed for %s: %s", symbol, exc)
+            return 50.0
 
     # ------------------------------------------------------------------
-    # Source 3: SEC EDGAR 8-K
+    # Source 3: SEC EDGAR 8-K (20%)
     # ------------------------------------------------------------------
-    def _fetch_sec_8k_articles(self, symbol: str) -> list[dict]:
-        """Fetches recent 8-K filings as article dicts."""
+    def _score_sec_8k(self, symbol: str) -> float:
         try:
             start = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
             resp = requests.get(
@@ -219,47 +257,58 @@ class SentimentAnalyzer:
             )
             resp.raise_for_status()
             hits = resp.json().get("hits", {}).get("hits", [])
-            articles = []
-            for hit in hits[:3]:
-                src = hit.get("_source", {})
-                articles.append({
-                    "headline": f"SEC 8-K Filing: {src.get('form_type', '8-K')}",
-                    "summary":  src.get("display_names", [""])[0] if src.get("display_names") else "",
-                    "created_at": src.get("file_date", ""),
-                })
-            return articles
+            if not hits:
+                return 50.0
+
+            scores = []
+            for hit in hits[:5]:
+                src  = hit.get("_source", {})
+                desc = " ".join(src.get("display_names", []))
+                if desc:
+                    scores.append(_vader_score(desc))
+
+            if not scores:
+                return 50.0
+
+            avg = sum(scores) / len(scores)
+            return _compound_to_100(avg)
+
         except Exception as exc:
-            logger.debug("SEC 8-K fetch failed for %s: %s", symbol, exc)
-            return []
+            logger.debug("SEC 8-K failed for %s: %s", symbol, exc)
+            return 50.0
 
     # ------------------------------------------------------------------
     # Public score()
     # ------------------------------------------------------------------
     def score(self, symbol: str) -> float:
         """
-        Returns sentiment score 0-100 using Claude API.
-        Combines Benzinga, Google News, and SEC 8-K articles.
-        Cached 2 hours. Returns 50.0 if no articles found.
+        Returns sentiment score 0-100 using VADER + financial lexicon.
+        Benzinga 50% + Google News 30% + SEC 8-K 20%.
+        Cached 2 hours.
         """
         cached = self._cache_get(symbol)
         if cached is not None:
             return cached
 
-        # Gather articles from all three sources
-        articles = []
-        articles += self._fetch_benzinga_articles(symbol)
-        if not articles:
-            articles += self._fetch_google_headlines(symbol)
-        articles += self._fetch_sec_8k_articles(symbol)
+        benzinga = self._score_benzinga(symbol)
+        google   = self._score_google_news(symbol)
+        sec_8k   = self._score_sec_8k(symbol)
 
-        if not articles:
-            # No news = neutral, don't waste an API call
-            self._cache_set(symbol, 50.0)
-            return 50.0
+        composite = round(
+            benzinga * 0.50
+            + google  * 0.30
+            + sec_8k  * 0.20,
+            2,
+        )
+        composite = max(0.0, min(100.0, composite))
 
-        score = _score_with_claude(symbol, articles)
-        self._cache_set(symbol, score)
-        return score
+        logger.debug(
+            "%s sentiment — Benzinga: %.1f  Google: %.1f  SEC 8-K: %.1f  → %.1f",
+            symbol, benzinga, google, sec_8k, composite,
+        )
+
+        self._cache_set(symbol, composite)
+        return composite
 
     def cache_size(self) -> int:
         return len(self._cache)

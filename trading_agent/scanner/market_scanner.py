@@ -31,6 +31,8 @@ from alpaca.trading.client import TradingClient
 from trading_agent.modules.fundamental import FundamentalAnalyzer
 from trading_agent.modules.sentiment import SentimentAnalyzer
 from trading_agent.modules.options_flow import OptionsAnalyzer
+from trading_agent.modules.performance_logger import PerformanceLogger
+from trading_agent.modules.dashboard import start_dashboard
 from alpaca.trading.requests import (
     GetAssetsRequest,
     MarketOrderRequest,
@@ -1118,11 +1120,25 @@ class TradingAgent:
                 )
                 continue
 
-            self.executor.submit(sig)
-            excluded.add(sym)
-            sector_counts[sector] = sector_counts.get(sector, 0) + 1
-            submitted += 1
-            logger.info("Slot used: %d / %d capacity this cycle.", submitted, capacity)
+            if self.executor.submit(sig):
+                excluded.add(sym)
+                sector_counts[sector] = sector_counts.get(sector, 0) + 1
+                submitted += 1
+                logger.info("Slot used: %d / %d capacity this cycle.", submitted, capacity)
+                # Log entry to performance tracker
+                t = sig.ticker
+                self.perf.log_entry(
+                    symbol      = t.symbol,
+                    entry_price = t.entry or 0.0,
+                    stop        = t.stop_loss or 0.0,
+                    target      = t.target or 0.0,
+                    qty         = sig.position_size,
+                    score       = t.composite_score,
+                    tech        = t.technical_score,
+                    fund        = t.fundamental_score,
+                    sent        = t.sentiment_score,
+                    opts        = t.options_score,
+                )
             await asyncio.sleep(0.5)
 
     async def run(self) -> None:
@@ -1141,6 +1157,8 @@ class TradingAgent:
         except Exception as exc:
             logger.error("Startup account check failed: %s", exc)
 
+        self.perf = PerformanceLogger()
+        start_dashboard(port=8080)
         logger.info("Modules active    : Technical | Fundamental (SEC EDGAR) | "
                     "Sentiment (Benzinga+Google+8-K) | Options (CBOE+Alpaca)")
         logger.info("Scan interval     : %ds", Config.SCAN_INTERVAL_SECONDS)
@@ -1151,6 +1169,7 @@ class TradingAgent:
         while True:
             try:
                 signals = await self.scan_cycle()
+                self.perf.check_exits(self.trading_client)
                 if signals:
                     await self.execute_signals(signals)
                 else:
