@@ -20,7 +20,9 @@ Scoring rubric (0-100):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -28,7 +30,8 @@ import httpx
 
 logger = logging.getLogger("FundamentalAnalyzer")
 
-HEADERS  = {"User-Agent": "ai-trading-agent contact@trading-agent.local"}
+HEADERS        = {"User-Agent": "ai-trading-agent contact@trading-agent.local"}
+FUND_CACHE_FILE = "/tmp/fundamental_cache.json"
 SEC_BASE = "https://data.sec.gov"
 WWW_SEC  = "https://www.sec.gov"
 
@@ -43,6 +46,31 @@ class FundamentalAnalyzer:
         self._cik_map: dict[str, str]                  = {}
         self._score_cache: dict[str, tuple[float, float]] = {}
         self._price_map: dict[str, float]              = {}
+        self._load_cache_from_disk()
+
+    def _load_cache_from_disk(self) -> None:
+        """Load persisted fundamental scores from disk on startup."""
+        try:
+            if os.path.exists(FUND_CACHE_FILE):
+                with open(FUND_CACHE_FILE) as f:
+                    raw = json.load(f)
+                now = time.time()
+                loaded = 0
+                for sym, (ts, score) in raw.items():
+                    if now - ts < self.CACHE_TTL:   # only load non-expired
+                        self._score_cache[sym] = (ts, score)
+                        loaded += 1
+                logger.info("Fundamental disk cache loaded: %d valid entries.", loaded)
+        except Exception as exc:
+            logger.debug("Fundamental cache load failed: %s", exc)
+
+    def _save_cache_to_disk(self) -> None:
+        """Persist current score cache to disk."""
+        try:
+            with open(FUND_CACHE_FILE, "w") as f:
+                json.dump(self._score_cache, f)
+        except Exception as exc:
+            logger.debug("Fundamental cache save failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Async HTTP — genuinely cancellable
@@ -236,6 +264,7 @@ class FundamentalAnalyzer:
             symbol, eps, pe, de, rev, total,
         )
         self._score_cache[symbol] = (time.time(), total)
+        self._save_cache_to_disk()
         return total
 
     def score(self, symbol: str) -> float:
