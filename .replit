@@ -3,9 +3,9 @@ modules = ["python-3.11"]
 expertMode = true
 
 [deployment]
-run = ["sh", "-c", "python3 main.py"]
+run = ["python3", "-u", "main.py"]
 deploymentTarget = "vm"
-ignorePorts = true
+build = ["pip", "install", "-r", "requirements.txt"]
 
 [nix]
 packages = ["glibcLocales"]
