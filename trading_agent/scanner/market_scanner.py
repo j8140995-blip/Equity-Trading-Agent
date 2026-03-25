@@ -112,7 +112,7 @@ class Config:
     # Score thresholds
     TECH_PREFILTER: float       = 30.0
     COMPOSITE_MIN: float        = 63.0   # raised from 55 — filters out low-conviction signals
-    MAX_FUNDAMENTAL_SCORES: int = 200    # top N for SEC EDGAR (slowest per ticker)
+    MAX_FUNDAMENTAL_SCORES: int = 500    # top N for SEC EDGAR (async httpx, genuinely cancellable)
 
     # Risk management
     MAX_PORTFOLIO_RISK_PCT: float = 2.0
@@ -911,7 +911,7 @@ class TradingAgent:
                 if done % 100 == 0 or done == total:
                     logger.info("  %s: %d / %d", label, done, total)
 
-        # Fundamentals — native async httpx, genuinely cancellable, top 200
+        # Fundamentals — native async httpx, genuinely cancellable, top 500
         fund_candidates = tech_results[:Config.MAX_FUNDAMENTAL_SCORES]
         logger.info("Pass 2a: fundamentals (top %d, native async) …", len(fund_candidates))
         for i, (c, _) in enumerate(fund_candidates):
