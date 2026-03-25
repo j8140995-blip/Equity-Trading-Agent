@@ -32,7 +32,6 @@ from trading_agent.modules.fundamental import FundamentalAnalyzer
 from trading_agent.modules.sentiment import SentimentAnalyzer
 from trading_agent.modules.options_flow import OptionsAnalyzer
 from trading_agent.modules.performance_logger import PerformanceLogger
-from trading_agent.modules.dashboard import start_dashboard
 from alpaca.trading.requests import (
     GetAssetsRequest,
     MarketOrderRequest,
@@ -1158,7 +1157,6 @@ class TradingAgent:
             logger.error("Startup account check failed: %s", exc)
 
         self.perf = PerformanceLogger()
-        start_dashboard(port=8080)
         logger.info("Modules active    : Technical | Fundamental (SEC EDGAR) | "
                     "Sentiment (Benzinga+Google+8-K) | Options (CBOE+Alpaca)")
         logger.info("Scan interval     : %ds", Config.SCAN_INTERVAL_SECONDS)
