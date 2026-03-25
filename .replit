@@ -5,7 +5,7 @@ expertMode = true
 [deployment]
 run = ["python3", "-u", "main.py"]
 deploymentTarget = "vm"
-build = ["pip", "install", "-r", "requirements.txt"]
+build = ["sh", "-c", "pip install -r requirements.txt"]
 
 [nix]
 packages = ["glibcLocales"]
