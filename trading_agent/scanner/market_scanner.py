@@ -147,6 +147,7 @@ class CandidateTicker:
 
     entry: Optional[float]       = None
     stop_loss: Optional[float]   = None
+    atr_dollar: Optional[float]  = None
     target: Optional[float]      = None
     risk_reward: Optional[float] = None
     direction: str               = "LONG"
@@ -509,19 +510,23 @@ class ScoringEngine:
             return None
         atr_dollar = candidate.price * (candidate.atr_pct / 100)
 
-        # Minimum stop distance: greater of ATR or 1% of price or $0.05
-        # Prevents Alpaca rejection ("stop_price must be <= base_price - 0.01")
-        min_stop_dist = max(atr_dollar, candidate.price * 0.01, 0.05)
+        # Stop: 2x ATR — gives position room to breathe through normal volatility
+        stop_dist = max(atr_dollar * 2.0, candidate.price * 0.02, 0.05)
 
-        entry      = candidate.price
-        stop_loss  = round(entry - min_stop_dist, 2)
-        target     = round(entry + (5 * min_stop_dist), 2)
+        entry     = candidate.price
+        stop_loss = round(entry - stop_dist, 2)
+
+        # Target: min(3x ATR, 8% above entry)
+        # Adaptive for volatile stocks, capped for stable ones
+        atr_target = entry + (3.0 * atr_dollar)
+        pct_target = entry * 1.08
+        target     = round(min(atr_target, pct_target), 2)
+
         rr = (target - entry) / (entry - stop_loss) if (entry - stop_loss) > 0 else 0
-        if rr < Config.RISK_REWARD_MIN:
-            return None
         candidate.entry       = entry
         candidate.stop_loss   = stop_loss
         candidate.target      = target
+        candidate.atr_dollar  = atr_dollar
         candidate.risk_reward = round(rr, 2)
         return candidate
 
@@ -742,15 +747,19 @@ class ExecutionEngine:
                 ticker.symbol, limit_price,
             )
 
-        # Recalculate stop and target against actual limit price, not snapshot.
-        # stop_price must be <= limit_price - 0.02 (Alpaca requires gap >= 0.01,
-        # we add extra buffer for safety). Preserve same stop distance as scored.
-        stop_distance = limit_price - (ticker.stop_loss or 0)
-        if stop_distance < 0.02:
-            # ATR too tight relative to live price — use 1% of limit price
-            stop_distance = round(limit_price * 0.01, 2)
-        stop_price   = round(limit_price - stop_distance, 2)
-        target_price = round(limit_price + (5 * stop_distance), 2)
+        # Recalculate stop and target against actual limit price.
+        # Stop: 2x ATR below entry for volatility-appropriate protection.
+        # Target: min(3x ATR, 8% above entry) — adaptive for volatile stocks,
+        #         capped for stable ones. Optimized via backtest.
+        atr_dollar    = ticker.atr_dollar if hasattr(ticker, "atr_dollar") and ticker.atr_dollar else limit_price * 0.02
+        stop_distance = max(atr_dollar * 2.0, limit_price * 0.02, 0.05)
+        stop_price    = round(limit_price - stop_distance, 2)
+        atr_target    = limit_price + (3.0 * atr_dollar)
+        pct_target    = limit_price * 1.08
+        target_price  = round(min(atr_target, pct_target), 2)
+        # Ensure minimum gap for Alpaca
+        if limit_price - stop_price < 0.02:
+            stop_price = round(limit_price - 0.02, 2)
 
         try:
             from alpaca.trading.requests import LimitOrderRequest
@@ -997,11 +1006,11 @@ class TradingAgent:
 
     async def _enforce_time_stops(self) -> None:
         """
-        Exits any position open for more than 3 trading days without
+        Exits any position open for more than 7 trading days without
         hitting stop-loss or take-profit. Prevents capital being locked
         in stagnant trades indefinitely.
         """
-        TIME_STOP_DAYS = 3
+        TIME_STOP_DAYS = 7
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
