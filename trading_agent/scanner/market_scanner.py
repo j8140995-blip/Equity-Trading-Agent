@@ -750,6 +750,19 @@ class ExecutionEngine:
                 ticker.symbol, limit_price,
             )
 
+        # Staleness check — if price has moved more than 3% since scoring,
+        # skip this order. Prevents entering positions already moved against us.
+        snapshot_price = ticker.entry or 0.0
+        if snapshot_price > 0:
+            price_drift = abs(limit_price - snapshot_price) / snapshot_price
+            if price_drift > 0.03:
+                logger.info(
+                    "Skipping %s — price drifted %.1f%% since scoring "
+                    "(snapshot $%.2f → live $%.2f)",
+                    ticker.symbol, price_drift * 100, snapshot_price, limit_price,
+                )
+                return False
+
         # Recalculate stop and target against actual limit price.
         # Stop: 2x ATR below entry for volatility-appropriate protection.
         # Target: min(3x ATR, 8% above entry) — adaptive for volatile stocks,
@@ -985,6 +998,18 @@ class TradingAgent:
             if c.composite_score < Config.COMPOSITE_MIN:
                 continue
 
+            # Skip tickers currently held or recently exited (last 7 days)
+            # Forces model to find fresh names instead of recycling the same top 10
+            if c.symbol in self._get_open_symbols():
+                continue
+            now_ts = time.time()
+            if c.symbol in self._recently_exited:
+                days_since_exit = (now_ts - self._recently_exited[c.symbol]) / 86400
+                if days_since_exit < 7:
+                    continue
+                else:
+                    del self._recently_exited[c.symbol]
+
             c = self.scorer.build_trade_setup(c)
             if c is None:
                 continue
@@ -1051,6 +1076,7 @@ class TradingAgent:
                             "Closing at market.", sym, age_days,
                         )
                         self.trading_client.close_position(sym)
+                        self._recently_exited[sym] = time.time()
 
                 except Exception as exc:
                     logger.debug("Time stop check failed for %s: %s", sym, exc)
@@ -1174,6 +1200,7 @@ class TradingAgent:
             logger.error("Startup account check failed: %s", exc)
 
         self.perf = PerformanceLogger()
+        self._recently_exited: dict[str, float] = {}  # symbol -> exit timestamp
         logger.info("Modules active    : Technical | Fundamental (SEC EDGAR) | "
                     "Sentiment (Benzinga+Google+8-K) | Options (CBOE+Alpaca)")
         logger.info("Scan interval     : %ds", Config.SCAN_INTERVAL_SECONDS)
@@ -1183,8 +1210,15 @@ class TradingAgent:
 
         while True:
             try:
+                # Track which symbols were open before checking exits
+                open_before = self._get_open_symbols()
                 signals = await self.scan_cycle()
                 self.perf.check_exits(self.trading_client)
+                # Any symbol that was open before but not after has exited
+                open_after = self._get_open_symbols()
+                for sym in open_before - open_after:
+                    self._recently_exited[sym] = time.time()
+                    logger.info("Exclusion: %s added to recently-exited list (7 day cooldown).", sym)
                 if signals:
                     await self.execute_signals(signals)
                 else:
