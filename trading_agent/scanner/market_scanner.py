@@ -111,7 +111,7 @@ class Config:
 
     # Score thresholds
     TECH_PREFILTER: float       = 30.0
-    COMPOSITE_MIN: float        = 63.0   # raised from 55 — filters out low-conviction signals
+    COMPOSITE_MIN: float        = 68.0   # raised from 55 — filters out low-conviction signals
     MAX_FUNDAMENTAL_SCORES: int = 500    # top N for SEC EDGAR (async httpx, genuinely cancellable)
 
     # Risk management
@@ -523,6 +523,9 @@ class ScoringEngine:
         target     = round(min(atr_target, pct_target), 2)
 
         rr = (target - entry) / (entry - stop_loss) if (entry - stop_loss) > 0 else 0
+        # Minimum R/R of 0.5 — filters worst setups while allowing new param range
+        if rr < 0.5:
+            return None
         candidate.entry       = entry
         candidate.stop_loss   = stop_loss
         candidate.target      = target
