@@ -524,7 +524,7 @@ class ScoringEngine:
 
         rr = (target - entry) / (entry - stop_loss) if (entry - stop_loss) > 0 else 0
         # Minimum R/R of 0.5 — filters worst setups while allowing new param range
-        if rr < 0.5:
+        if rr < 1.0:
             return None
         candidate.entry       = entry
         candidate.stop_loss   = stop_loss
@@ -1068,14 +1068,19 @@ class TradingAgent:
             return set()
 
     def _get_pending_order_symbols(self) -> set[str]:
-        """Returns set of ticker symbols with open/pending orders."""
+        """Returns set of ticker symbols with open BUY orders only.
+        Sell-side bracket legs (stop/take-profit) are excluded — they are
+        child orders on existing positions, not new position openings."""
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
             orders = self.trading_client.get_orders(
                 GetOrdersRequest(status=QueryOrderStatus.OPEN)
             )
-            return {o.symbol for o in orders}
+            return {
+                o.symbol for o in orders
+                if str(o.side).lower() in ("buy", "orderside.buy")
+            }
         except Exception as exc:
             logger.error("Failed to fetch open orders: %s", exc)
             return set()
