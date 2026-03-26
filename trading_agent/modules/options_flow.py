@@ -291,14 +291,21 @@ class OptionsAnalyzer:
     # ------------------------------------------------------------------
     # Public score()
     # ------------------------------------------------------------------
-    def score(self, symbol: str) -> float:
+    def score(self, symbol: str, range_position: float = 0.5) -> float:
         """
         Returns options flow score 0-100.
         Combines P/C ratio, IV percentile, delta-weighted flow, OI concentration.
         IV history persists to disk across restarts.
+
+        range_position: where price sits in its 52-week range (0=low, 1=high).
+        Passed in from scanner which has OHLCV data. Used to cap options score
+        on broken/downtrending stocks where options metrics can be misleading.
         """
         cached = self._cache_get(symbol)
         if cached is not None:
+            # Apply range cap even on cached scores
+            if range_position < 0.20:
+                return min(cached, 50.0)
             return cached
 
         self._maybe_save_iv()
@@ -313,6 +320,16 @@ class OptionsAnalyzer:
         oi_score    = self._score_oi_concentration(calls)
 
         total = round(min(max(pc_score + iv_score + delta_score + oi_score, 0.0), 100.0), 2)
+
+        # Cap options score for stocks in bottom 20% of 52-week range.
+        # Downtrending stocks can show misleading bullish options metrics
+        # (put sellers, thin volume, OI concentration artifacts).
+        if range_position < 0.20:
+            total = min(total, 50.0)
+            logger.debug("%s options capped at 50 — in bottom 20%% of 52w range", symbol)
+        elif range_position < 0.35:
+            total = min(total, 65.0)
+            logger.debug("%s options capped at 65 — in bottom 35%% of 52w range", symbol)
 
         logger.debug(
             "%s options — P/C: %.0f  IV: %.0f  Delta: %.0f  OI: %.0f  → %.1f",
