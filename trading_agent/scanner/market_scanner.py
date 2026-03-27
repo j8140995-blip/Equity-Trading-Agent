@@ -375,17 +375,21 @@ class TechnicalAnalyzer:
 
     def __init__(self, data_client: StockHistoricalDataClient):
         self.data = data_client
-        self._last_range_position: float = 0.5
+        self._range_positions: dict[str, float] = {}  # symbol -> range position, thread-safe per-symbol
 
     def _fetch_ohlcv(self, symbol: str) -> pd.DataFrame:
         try:
+            # Need 300+ bars for accurate EMA200 and true 52-week range.
+            # start=2 years ago ensures we get full history regardless of limit.
+            from datetime import timedelta
+            start_dt = datetime.now(timezone.utc) - timedelta(days=730)
             bars = self.data.get_stock_bars(
                 StockBarsRequest(
                     symbol_or_symbols=symbol,
                     timeframe=TimeFrame.Day,
-                    start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    start=start_dt,
                     end=datetime.now(timezone.utc),
-                    limit=120,
+                    limit=600,
                     feed="iex",
                 )
             )
@@ -401,7 +405,7 @@ class TechnicalAnalyzer:
 
     def score(self, symbol: str) -> float:
         df = self._fetch_ohlcv(symbol)
-        if df.empty or len(df) < 50:
+        if df.empty or len(df) < 100:
             return 0.0
 
         df["ema20"]  = ta_lib.trend.ema_indicator(df["close"], window=20)
@@ -481,7 +485,7 @@ class TechnicalAnalyzer:
         low_52w  = df["low"].tail(252).min()  if len(df) >= 252 else df["low"].min()
         price_range = high_52w - low_52w
         # Store range position as instance variable for retrieval by scanner
-        self._last_range_position = float((row["close"] - low_52w) / price_range) if price_range > 0 else 0.5
+        self._range_positions[symbol] = float((row["close"] - low_52w) / price_range) if price_range > 0 else 0.5
         if price_range > 0:
             position_in_range = (row["close"] - low_52w) / price_range
             if position_in_range < 0.20:
@@ -506,7 +510,11 @@ class TechnicalAnalyzer:
                 else:
                     total -= 5    # just below 200d
 
-        return max(0.0, min(total, 100.0))
+        range_pos  = self._range_positions.get(symbol, 0.5)
+        atr_dollar = float(row["atr"]) if not pd.isna(row["atr"]) else 0.0
+        # Store for backward compat — but now also returned directly
+        self._range_positions[symbol] = range_pos
+        return max(0.0, min(total, 100.0)), range_pos, atr_dollar
 
 
 # ---------------------------------------------------------------------------
@@ -543,9 +551,17 @@ class ScoringEngine:
         return candidate
 
     def build_trade_setup(self, candidate: CandidateTicker) -> Optional[CandidateTicker]:
-        if candidate.price <= 0 or candidate.atr_pct <= 0:
+        if candidate.price <= 0:
             return None
-        atr_dollar = candidate.price * (candidate.atr_pct / 100)
+
+        # Use historical ATR from technical module if available (more accurate).
+        # Falls back to snapshot day range (atr_pct) if historical ATR not set.
+        if candidate.atr_dollar and candidate.atr_dollar > 0:
+            atr_dollar = candidate.atr_dollar
+        elif candidate.atr_pct > 0:
+            atr_dollar = candidate.price * (candidate.atr_pct / 100)
+        else:
+            return None
 
         # Stop: 2x ATR — gives position room to breathe through normal volatility
         stop_dist = max(atr_dollar * 2.0, candidate.price * 0.02, 0.05)
@@ -904,13 +920,23 @@ class TradingAgent:
         logger.info("Scoring %d pre-filtered candidates …", len(candidates))
 
         # --- Pass 1: technical scoring (fast, no quota cost) ---
+        # tech.score() returns (score, range_position, atr_dollar) — all computed
+        # atomically in one OHLCV fetch, no shared state race conditions.
         tech_results: list[tuple[CandidateTicker, float]] = []
         for c in candidates:
-            tech_score = await asyncio.to_thread(self.tech.score, c.symbol)
+            result = await asyncio.to_thread(self.tech.score, c.symbol)
+            # Unpack tuple: (score, range_position, atr_dollar)
+            if isinstance(result, tuple):
+                tech_score, range_pos, atr_dollar = result
+            else:
+                tech_score, range_pos, atr_dollar = float(result), 0.5, 0.0
             scored += 1
             if scored % 100 == 0:
                 logger.info("  … scored %d / %d", scored, len(candidates))
             if tech_score >= Config.TECH_PREFILTER:
+                # Store range_position and historical ATR on candidate
+                c.range_position = range_pos
+                c.atr_dollar     = atr_dollar
                 tech_results.append((c, tech_score))
 
         # Sort by tech score descending
@@ -1034,9 +1060,8 @@ class TradingAgent:
             c.options_score     = opts
 
             # Apply range position cap to options score
-            # Range position is stored by TechnicalAnalyzer during Pass 1
-            # Bottom 20% of 52w range -> options capped at 50 (neutral)
-            range_pos = getattr(self.tech, '_last_range_position', 0.5)
+            # range_position stored on candidate during Pass 1 (thread-safe)
+            range_pos = c.range_position
             if opts > 50.0 and range_pos < 0.20:
                 opts = min(opts, 50.0)
             elif opts > 65.0 and range_pos < 0.35:

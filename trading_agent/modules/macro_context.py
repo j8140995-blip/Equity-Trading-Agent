@@ -93,27 +93,36 @@ class MacroContextAnalyzer:
 
     def _get_bars(self, symbols: list[str], limit: int = 210) -> dict[str, list[dict]]:
         """Fetch daily bars for multiple symbols from Alpaca."""
-        try:
-            resp = requests.get(
-                "https://data.alpaca.markets/v2/stocks/bars",
-                headers={
-                    "APCA-API-KEY-ID":     self.key,
-                    "APCA-API-SECRET-KEY": self.secret,
-                },
-                params={
-                    "symbols":   ",".join(symbols),
-                    "timeframe": "1Day",
-                    "limit":     limit,
-                    "feed":      "iex",
-                    "adjustment": "split",
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return resp.json().get("bars", {})
-        except Exception as exc:
-            logger.warning("Macro bars fetch failed: %s", exc)
-            return {}
+        from datetime import date, timedelta
+        end   = date.today().isoformat()
+        start = (date.today() - timedelta(days=365)).isoformat()
+        all_bars: dict[str, list[dict]] = {}
+        # Fetch in batches of 5 to avoid response size limits
+        for i in range(0, len(symbols), 5):
+            batch = symbols[i:i+5]
+            try:
+                resp = requests.get(
+                    "https://data.alpaca.markets/v2/stocks/bars",
+                    headers={
+                        "APCA-API-KEY-ID":     self.key,
+                        "APCA-API-SECRET-KEY": self.secret,
+                    },
+                    params={
+                        "symbols":    ",".join(batch),
+                        "timeframe":  "1Day",
+                        "start":      start,
+                        "end":        end,
+                        "limit":      300,
+                        "feed":       "iex",
+                        "adjustment": "split",
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                all_bars.update(resp.json().get("bars", {}))
+            except Exception as exc:
+                logger.warning("Macro bars fetch failed for %s: %s", batch, exc)
+        return all_bars
 
     def _ema(self, prices: list[float], window: int) -> float:
         """Simple EMA calculation."""
@@ -124,6 +133,83 @@ class MacroContextAnalyzer:
         for p in prices[1:]:
             ema = p * k + ema * (1 - k)
         return ema
+
+    def _fetch_vix(self) -> float:
+        """Fetch current VIX level from Yahoo Finance. Falls back to 20 on error."""
+        try:
+            resp = requests.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
+                headers={"User-Agent": "trading-agent/1.0"},
+                params={"interval": "1d", "range": "5d"},
+                timeout=8,
+            )
+            resp.raise_for_status()
+            data   = resp.json()
+            closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            vix    = next((v for v in reversed(closes) if v is not None), 20.0)
+            logger.info("VIX: %.1f (live)", vix)
+            return round(float(vix), 1)
+        except Exception as exc:
+            logger.warning("VIX fetch failed: %s — using fallback", exc)
+            return self._vix_from_spy_drawdown()
+
+    def _vix_from_spy_drawdown(self) -> float:
+        """Fallback: estimate VIX from SPY's drawdown from 20-day high."""
+        try:
+            resp = requests.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/SPY",
+                headers={"User-Agent": "trading-agent/1.0"},
+                params={"interval": "1d", "range": "1mo"},
+                timeout=8,
+            )
+            resp.raise_for_status()
+            closes  = resp.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            closes  = [c for c in closes if c is not None]
+            if len(closes) < 5:
+                return 20.0
+            high_20 = max(closes[-20:]) if len(closes) >= 20 else max(closes)
+            current = closes[-1]
+            drawdown = (high_20 - current) / high_20
+            if drawdown >= 0.12:  return 35.0
+            elif drawdown >= 0.08: return 28.0
+            elif drawdown >= 0.05: return 24.0
+            elif drawdown >= 0.03: return 21.0
+            else:                  return 17.0
+        except Exception:
+            return 20.0
+
+    def _fetch_market_news_sentiment(self) -> float:
+        """
+        Fetch recent market news headlines and score sentiment.
+        Returns a score from -1 (very bearish) to +1 (very bullish).
+        Used as an additional regime signal alongside price-based indicators.
+        """
+        BEARISH_TERMS = ["recession", "tariff", "crash", "crisis", "war", "inflation",
+                         "selloff", "plunge", "collapse", "fear", "deficit", "downgrade"]
+        BULLISH_TERMS = ["rally", "surge", "beat", "growth", "recovery", "record",
+                         "upgrade", "boom", "breakout", "strong", "optimism"]
+        try:
+            resp = requests.get(
+                "https://news.google.com/rss/search",
+                params={"q": "stock market S&P 500", "hl": "en-US", "gl": "US", "ceid": "US:en"},
+                timeout=6,
+            )
+            resp.raise_for_status()
+            import xml.etree.ElementTree as ET
+            root  = ET.fromstring(resp.text)
+            items = root.findall(".//item")[:10]
+            bull  = 0
+            bear  = 0
+            for item in items:
+                text = (item.findtext("title") or "").lower()
+                bull += sum(1 for t in BULLISH_TERMS if t in text)
+                bear += sum(1 for t in BEARISH_TERMS if t in text)
+            total = bull + bear
+            if total == 0:
+                return 0.0
+            return round((bull - bear) / total, 2)
+        except Exception:
+            return 0.0
 
     def _sector_relative_strength(self, bars: dict[str, list[dict]]) -> dict[str, float]:
         """
@@ -194,17 +280,8 @@ class MacroContextAnalyzer:
         else:
             regime.qqq_above_200d = True
 
-        # VIX proxy via VIXY (ProShares VIX Short-Term Futures ETF)
-        # VIXY moves with VIX — use it as a fear gauge
-        vixy_bars = bars.get("VIXY", [])
-        if len(vixy_bars) >= 20:
-            vixy_closes   = [b["c"] for b in vixy_bars]
-            vixy_current  = vixy_closes[-1]
-            vixy_20d_avg  = sum(vixy_closes[-20:]) / 20
-            # Normalize to approximate VIX level (VIXY ~= VIX/4 roughly)
-            regime.vix_level = round(vixy_current * 4, 1)
-        else:
-            regime.vix_level = 20.0  # assume normal if no data
+        # VIX: fetch real VIX level from Yahoo Finance (free, no auth)
+        regime.vix_level = self._fetch_vix()
 
         # Sector relative strength
         rs = self._sector_relative_strength(bars)
@@ -216,6 +293,10 @@ class MacroContextAnalyzer:
         regime.leading_sectors = [s for s, v in sorted_sectors[:3] if v > 0]
         regime.lagging_sectors = [s for s, v in sorted_sectors[-3:] if v < 0]
 
+        # Market news sentiment
+        news_sentiment = self._fetch_market_news_sentiment()
+        logger.info("Market news sentiment: %.2f", news_sentiment)
+
         # Classify regime
         if regime.vix_level > 35:
             regime.regime = "CRISIS"
@@ -225,23 +306,25 @@ class MacroContextAnalyzer:
             regime.regime = "RISK_OFF"
             regime.threshold_adjustment = +5.0
             regime.position_size_multiplier = 0.75
-        elif regime.spy_above_200d and regime.qqq_above_200d and regime.vix_level < 18:
+        elif regime.spy_above_200d and regime.qqq_above_200d and regime.vix_level < 18 and news_sentiment >= -0.2:
             regime.regime = "RISK_ON"
-            regime.threshold_adjustment = -2.0    # slightly lower threshold
+            regime.threshold_adjustment = -2.0
             regime.position_size_multiplier = 1.0
         else:
             regime.regime = "NEUTRAL"
-            regime.threshold_adjustment = 0.0
+            # News sentiment nudges threshold: very bearish news adds 2pts
+            regime.threshold_adjustment = -2.0 if news_sentiment > 0.3 else (2.0 if news_sentiment < -0.3 else 0.0)
             regime.position_size_multiplier = 1.0
 
         # Build summary
         event_note = " | ⚠ MACRO EVENT DAY" if regime.is_macro_event_day else ""
+        news_note  = f" | News: {'+' if news_sentiment > 0 else ''}{news_sentiment:.2f}"
         regime.summary = (
             f"Regime: {regime.regime} | SPY>200d: {regime.spy_above_200d} | "
             f"VIX~{regime.vix_level:.0f} | "
             f"Leading: {','.join(regime.leading_sectors) or 'none'} | "
             f"Lagging: {','.join(regime.lagging_sectors) or 'none'}"
-            f"{event_note}"
+            f"{news_note}{event_note}"
         )
 
         logger.info("Macro: %s", regime.summary)
