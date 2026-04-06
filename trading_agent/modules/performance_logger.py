@@ -121,13 +121,14 @@ class PerformanceLogger:
         for symbol, trade in list(self._data["open_trades"].items()):
             if symbol not in open_symbols:
                 # Position closed — determine exit price from Alpaca activities
-                exit_price = self._get_exit_price(trading_client, symbol,
-                                                   trade["entry_time"])
-                if exit_price is None:
+                result = self._get_exit_price(trading_client, symbol,
+                                               trade["entry_time"])
+                if result is None:
                     # Can't determine exit yet — skip this cycle
                     continue
 
-                self._record_exit(symbol, trade, exit_price)
+                exit_price, reason = result
+                self._record_exit(symbol, trade, exit_price, reason)
                 closed_this_cycle.append(symbol)
 
         for sym in closed_this_cycle:
@@ -141,54 +142,63 @@ class PerformanceLogger:
             self.print_summary()
 
     def _get_exit_price(self, trading_client, symbol: str,
-                        entry_time: str) -> Optional[float]:
-        """Fetch the fill price of the most recent sell order for this symbol."""
+                        entry_time: str) -> Optional[tuple[float, str]]:
+        """
+        Fetch the fill price and exit reason of the most recent sell order.
+        Returns (exit_price, reason) or None.
+        Reason is derived from the actual Alpaca order type:
+          - stop / stop_limit -> STOP_LOSS
+          - limit (take profit leg) -> TAKE_PROFIT
+          - market (time stop / manual) -> TIME_STOP or MANUAL
+        """
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
 
             orders = trading_client.get_orders(
-                GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=50)
+                GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
             )
             sell_orders = [
                 o for o in orders
                 if o.symbol == symbol
-                and str(o.side) in ("OrderSide.SELL", "sell")
+                and str(o.side).lower() in ("orderside.sell", "sell")
                 and o.filled_avg_price is not None
             ]
             if not sell_orders:
                 return None
 
-            # Most recent sell
             sell_orders.sort(
                 key=lambda o: o.filled_at or o.submitted_at,
                 reverse=True,
             )
-            return float(sell_orders[0].filled_avg_price)
+            order      = sell_orders[0]
+            exit_price = float(order.filled_avg_price)
+            order_type = str(order.order_type).lower()
+
+            if "stop" in order_type:
+                reason = "STOP_LOSS"
+            elif order_type in ("limit", "ordertype.limit"):
+                reason = "TAKE_PROFIT"
+            elif order_type in ("market", "ordertype.market"):
+                reason = "TIME_STOP"
+            else:
+                reason = "MANUAL_OR_TIME"
+
+            return exit_price, reason
         except Exception as exc:
             logger.debug("PERF | Exit price fetch failed for %s: %s", symbol, exc)
             return None
 
-    def _record_exit(self, symbol: str, trade: dict, exit_price: float) -> None:
+    def _record_exit(self, symbol: str, trade: dict, exit_price: float,
+                     reason: str = "MANUAL_OR_TIME") -> None:
         """Compute P&L and log the closed trade."""
-        entry    = trade["entry_price"]
-        stop     = trade["stop"]
-        target   = trade["target"]
-        qty      = trade["qty"]
-        risk_ps  = trade["risk_per_share"]
-        reward_ps = trade["reward_per_share"]
+        entry     = trade["entry_price"]
+        qty       = trade["qty"]
+        risk_ps   = trade["risk_per_share"]
 
         pnl_per_share = exit_price - entry
         pnl_dollars   = round(pnl_per_share * qty, 2)
         pnl_pct       = round((pnl_per_share / entry) * 100, 2) if entry > 0 else 0
-
-        # Determine exit reason
-        if exit_price >= target * 0.98:
-            reason = "TAKE_PROFIT"
-        elif exit_price <= stop * 1.02:
-            reason = "STOP_LOSS"
-        else:
-            reason = "MANUAL_OR_TIME"
 
         # Realized R/R: how many R multiples did we capture?
         rr_realized = round(pnl_per_share / risk_ps, 2) if risk_ps > 0 else 0
