@@ -22,5 +22,5 @@ anyio==4.12.1
 # Sentiment
 vaderSentiment>=3.3.2
 
-# Dashboard
+# Web dashboard
 flask>=3.0.0
