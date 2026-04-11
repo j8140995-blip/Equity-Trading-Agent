@@ -23,7 +23,7 @@ from typing import Optional
 
 logger = logging.getLogger("PerformanceLogger")
 
-PERF_LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "performance_log.json")
+PERF_LOG_FILE = os.path.join(os.getcwd(), "performance_log.json")
 
 
 def _load_log() -> dict:

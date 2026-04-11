@@ -31,7 +31,7 @@ import httpx
 logger = logging.getLogger("FundamentalAnalyzer")
 
 HEADERS        = {"User-Agent": "ai-trading-agent contact@trading-agent.local"}
-FUND_CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "fundamental_cache.json")
+FUND_CACHE_FILE = os.path.join(os.getcwd(), "fundamental_cache.json")
 SEC_BASE = "https://data.sec.gov"
 WWW_SEC  = "https://www.sec.gov"
 
