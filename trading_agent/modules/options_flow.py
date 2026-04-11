@@ -36,7 +36,7 @@ logger = logging.getLogger("OptionsAnalyzer")
 
 CBOE_HEADERS  = {"User-Agent": "trading-agent/1.0"}
 CENTRAL       = ZoneInfo("America/Chicago")
-IV_CACHE_FILE = "/tmp/options_iv_history.json"   # persists across restarts
+IV_CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "options_iv_history.json")   # persists across restarts
 
 
 def _is_market_hours() -> bool:
