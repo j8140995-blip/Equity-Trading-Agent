@@ -8,7 +8,7 @@ Records:
   - Exit: exit price, exit reason (stop/target/time/manual), P&L $, P&L %, R/R realized
   - Aggregates: win rate, avg P&L, avg R/R, total return
 
-Data persists to /tmp/performance_log.json across restarts.
+Data persists to ./performance_log.json in project root — survives redeployments.
 Summary printed to logs every 10 cycles.
 """
 
@@ -23,7 +23,7 @@ from typing import Optional
 
 logger = logging.getLogger("PerformanceLogger")
 
-PERF_LOG_FILE = "/tmp/performance_log.json"
+PERF_LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "performance_log.json")
 
 
 def _load_log() -> dict:
