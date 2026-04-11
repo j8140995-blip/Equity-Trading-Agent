@@ -21,7 +21,7 @@ from flask import Flask, jsonify, render_template_string
 
 logger = logging.getLogger("Dashboard")
 
-PERF_LOG_FILE = "/tmp/performance_log.json"
+PERF_LOG_FILE = os.path.join(os.getcwd(), "performance_log.json")
 
 app = Flask(__name__)
 log = logging.getLogger("werkzeug")
