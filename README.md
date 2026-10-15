@@ -1,6 +1,6 @@
 # AI Trading Agent
 
-An autonomous equities paper-trading agent that scans ~2,500 US tickers per cycle, scores them across four independent signal modules plus a macro regime filter, and executes bracketed orders through Alpaca's paper API. Runs 24/7 on a Replit Reserved VM with a live web dashboard.
+An autonomous equities paper-trading agent that scans ~2,500 US tickers per cycle, scores them across four independent signal modules plus a macro regime filter, and executes bracketed orders through Alpaca's paper API. Runs 24/7 on a Replit Reserved VM with a live web dashboard. Go to relit-agent branch to see code files.
 
 **Status:** Paper trading only. No real capital. Currently paused pending signal validation (see [Findings](#findings)).
 
